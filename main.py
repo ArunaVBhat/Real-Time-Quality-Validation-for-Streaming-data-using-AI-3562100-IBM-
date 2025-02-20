@@ -1,90 +1,113 @@
-import pandas as pd
 import os
-import plotly.express as px
-from dash import Dash, dcc, html
-from sklearn.ensemble import IsolationForest
-from sklearn.metrics import precision_score, recall_score, f1_score
+import requests
+from fastapi import FastAPI, HTTPException
+import joblib
+import numpy as np
+import pandas as pd
+from pydantic import BaseModel
+from starlette.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
 
-# Folder containing multiple CSV files
-folder_path = r"kagglehub/datasets/boltzmannbrain/nab/versions/1/artificialWithAnomaly/artificialWithAnomaly"
-for file_name in os.listdir(folder_path):
-    print(f"Processing file: {file_name}")
-    file_path = os.path.join(folder_path, file_name)
-    temp_df = pd.read_csv(file_path)
-    print(f"Columns in {file_name}: {list(temp_df.columns)}")
+# Load trained model and scaler
+model = joblib.load("anomaly_model.pkl")
+scaler = joblib.load("scaler.pkl")
 
-# Combine all CSV files into a single DataFrame
-all_data = pd.DataFrame()
+app = FastAPI()
 
-for file_name in os.listdir(folder_path):
-    if file_name.endswith('.csv'):  # Only process CSV files
-        file_path = os.path.join(folder_path, file_name)
-        temp_df = pd.read_csv(file_path)
+# Enable CORS (Allows frontend on different port)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins (including localhost:8001)
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all HTTP methods (POST, GET, etc.)
+    allow_headers=["*"],  # Allow all headers
+)
 
-        # Check if required columns exist
-        if 'timestamp' in temp_df.columns and 'value' in temp_df.columns:
-            temp_df['timestamp'] = pd.to_datetime(temp_df['timestamp'], errors='coerce')  # Handle invalid timestamps
-            temp_df.dropna(subset=['timestamp', 'value'], inplace=True)  # Drop rows with invalid timestamps or values
-            temp_df['file_name'] = file_name  # Add a column to track source file
-            all_data = pd.concat([all_data, temp_df], ignore_index=True)
-        else:
-            print(f"Skipping {file_name} - Missing required columns 'timestamp' or 'value'")
+# Dummy metrics (Update this dynamically in model training)
+latest_metrics = {
+    "accuracy": 0.95,
+    "precision": 0.92,
+    "recall": 0.85,
+    "f1_score": 0.88
+}
 
-# Check if all_data is empty after processing
-if all_data.empty:
-    raise ValueError("No valid data found. Ensure all CSV files have 'timestamp' and 'value' columns.")
 
-# Preprocess data
-all_data = all_data.sort_values(by='timestamp')  # Sort by timestamp
+# Define Input Data Model
+class PredictionInput(BaseModel):
+    value: float
 
-# Set up an anomaly detection threshold
-threshold = all_data['value'].mean() + 1 * all_data['value'].std()
-all_data['anomaly_flag'] = all_data['value'].apply(lambda x: 'Anomaly' if x > threshold else 'Normal')
 
-# Simulate ground truth labels for evaluation
-all_data['ground_truth_label'] = all_data['value'].apply(lambda x: 'Anomaly' if x > 60 else 'Normal')
+@app.get("/")
+async def root():
+    return {"message": "Server is running successfully!"}
 
-# Train Isolation Forest model
-model = IsolationForest(contamination=0.05, random_state=42)
-model.fit(all_data[['value']])
-all_data['predicted_labels'] = model.predict(all_data[['value']])
-all_data['predicted_labels'] = all_data['predicted_labels'].map({1: 'Normal', -1: 'Anomaly'})
 
-# Evaluate the model
-y_true = all_data['ground_truth_label'].map({'Normal': 0, 'Anomaly': 1})
-y_pred = all_data['predicted_labels'].map({'Normal': 0, 'Anomaly': 1})
+@app.post("/predict")
+async def predict(data: PredictionInput):
+    """Predict if the given value is an anomaly or normal."""
+    try:
+        print(f"📥 Received Data: {data}")
 
-precision = precision_score(y_true, y_pred, zero_division=1)
-recall = recall_score(y_true, y_pred, zero_division=1)
-f1 = f1_score(y_true, y_pred, zero_division=1)
+        # Convert input to DataFrame
+        df = pd.DataFrame([[data.value]])
 
-# Initialize Dash app
-app = Dash(__name__)
+        # Scale data
+        X = scaler.transform(df)
 
-# App layout
-app.layout = html.Div([
-    html.H1("Multi-File Anomaly Detection Dashboard", style={'textAlign': 'center'}),
-    dcc.Graph(
-        id='dataset-graph',
-        figure=px.scatter(
-            all_data,
-            x='timestamp',
-            y='value',
-            color='anomaly_flag',
-            color_discrete_map={'Anomaly': 'red', 'Normal': 'blue'},
-            title="Anomalies in Combined Dataset",
-            labels={'anomaly_flag': 'Status'},
-            hover_data=['file_name']  # Show the source file in the hover tooltip
-        )
-    ),
-    html.Div([
-        html.H3("Model Metrics"),
-        html.P(f"Precision: {precision:.2f}"),
-        html.P(f"Recall: {recall:.2f}"),
-        html.P(f"F1 Score: {f1:.2f}"),
-    ], style={'textAlign': 'center', 'marginTop': '20px'})
-])
+        # Predict anomaly
+        prediction = model.predict(X)
+        print(f"✅ Prediction: {prediction}")
 
-# Run the app
-if __name__ == '__main__':
-    app.run_server(debug=True)
+        return {"status": "Anomaly" if prediction[0] == -1 else "Normal"}
+
+    except Exception as e:
+        print(f"❌ Error in /predict: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/metrics")
+async def get_metrics():
+    """Returns model performance metrics."""
+    return latest_metrics
+
+
+@app.get("/roc_curve")
+async def get_roc_curve():
+    """Serve the ROC curve image."""
+    roc_path = "static/images/roc_curve.png"
+    if os.path.exists(roc_path):
+        return FileResponse(roc_path, media_type="image/png")
+    return {"error": "ROC Curve image not found"}
+
+@app.get("/confusion_matrix")
+async def get_confusion_matrix():
+    """Serve the confusion matrix image."""
+    cm_path = "static/images/confusion_matrix.png"
+    if os.path.exists(cm_path):
+        return FileResponse(cm_path, media_type="image/png")
+    return {"error": "Confusion matrix image not found"}
+
+
+
+# Secure API key handling
+API_KEY = os.getenv("IBM_API_KEY", "rEZVrJss_RizGpEq83sgycul6yV6m-Ipsdo7XfRgWW2_")
+MODEL_URL = os.getenv("IBM_MODEL_URL", "https://us-south.ml.cloud.ibm.com")
+
+
+def get_prediction(data):
+    """Calls an external IBM Cloud ML Model."""
+    if not API_KEY or not MODEL_URL:
+        return {"error": "API Key or Model URL not configured"}
+
+    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
+    response = requests.post(MODEL_URL, json=data, headers=headers)
+
+    if response.status_code == 200:
+        return response.json()
+    else:
+        return {"error": f"External model error: {response.text}"}
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
